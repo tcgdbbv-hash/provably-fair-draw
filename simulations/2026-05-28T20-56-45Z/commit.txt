@@ -1,0 +1,10 @@
+========================================================================
+RAFFLE COMMITMENT (PUBLISH THE COMMITMENT HASH BEFORE THE DRAW)
+========================================================================
+  seed_file                  .draw-state/server_seed.txt
+  server_seed (KEEP SECRET)  45d80e256ceb26ca6a285332ba10d2f1192daa540da2da7b9222a5b617c2e29b
+  commitment_hash (publish)  59c2cb3426d6fd8757962d8b7def9b9606586c519b29d90319f679a9289ca7ee
+  hash function              sha256(server_seed_hex_utf8)
+
+publish only the commitment_hash now.
+reveal server_seed AFTER the draw window closes, alongside the public_seed and winners.
