@@ -36,6 +36,11 @@ fix is a two-step scheme:
 
 USAGE
 
+  Optional - snapshot SPL token holders from Helius into a wallet file:
+    python draw.py snapshot --mint <SPL_MINT> --output wallets.txt \\
+      [--min-balance 1000000] [--decimals 6] [--exclude ADDR1,ADDR2]
+    # HELIUS_API_KEY env var (or --helius-api-key) required.
+
   Phase 1 - commit a seed (writes to .draw-state/server_seed.txt):
     python draw.py commit
 
@@ -64,20 +69,26 @@ ALGORITHM
 
 NO EXTERNAL DEPENDENCIES
 
-  hashlib, hmac, secrets are all stdlib.  This is intentional so the
-  script can be audited by anyone with a fresh Python install and so
-  the verification path stays trivially reproducible.
+  hashlib, hmac, secrets, urllib are all stdlib.  Intentional - the
+  script can be audited by anyone with a fresh Python install and the
+  verification path stays trivially reproducible.  The Helius snapshot
+  uses urllib.request so there's no httpx / requests dependency to vet.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import hmac
+import json
+import os
 import secrets
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 # State file lives alongside wherever the operator runs the script from.
 # Kept out of the repo via .gitignore - the seed is secret until reveal.
@@ -89,16 +100,28 @@ def _read_wallet_list(path: str) -> List[str]:
     """Load a wallet list from disk.
 
     Format: one wallet per line.  Blank lines and lines starting with '#'
-    are ignored, leading/trailing whitespace is stripped.  No format
-    validation - if the input has bad addresses the draw still works
-    deterministically against whatever strings are there.
+    are ignored.  Inline comments after the wallet (e.g. "<addr>  # 12.4")
+    are also stripped - the `snapshot` subcommand writes balances after
+    a '#' so the file is human-readable, and the draw must not see those
+    annotations as part of the wallet string.  Leading/trailing whitespace
+    is stripped.  No format validation - if the input has bad addresses
+    the draw still works deterministically against whatever strings
+    survive parsing.
     """
     raw = Path(path).read_text().splitlines()
-    return [
-        line.strip()
-        for line in raw
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    wallets: List[str] = []
+    for line in raw:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        # Strip trailing inline comment: everything from the first '#'
+        # onwards is annotation, not part of the wallet identifier.
+        hash_pos = s.find("#")
+        if hash_pos != -1:
+            s = s[:hash_pos].strip()
+        if s:
+            wallets.append(s)
+    return wallets
 
 
 def deterministic_select(
@@ -156,6 +179,166 @@ def _print_block(title: str, rows: List[tuple[str, str]]) -> None:
     for label, value in rows:
         print(f"  {label.ljust(width)}  {value}")
     print()
+
+
+# --- Helius snapshot --------------------------------------------------------
+#
+# `getTokenAccounts` is a Helius RPC extension that indexes SPL token
+# accounts by mint - the only practical way to enumerate "every wallet
+# holding token X" without scanning the full SPL Token program ledger
+# yourself.  Docs: https://docs.helius.dev/solana-rpc-nodes/digital-asset-standard-das-api/getting-started/get-token-accounts
+#
+# Pagination is cursor-based, capped at 1000 accounts per page.  One owner
+# can hold multiple accounts under the same mint (e.g. an Associated Token
+# Account + a legacy one), so we sum raw amounts per owner before filtering
+# by threshold.
+
+HELIUS_BASE = "https://mainnet.helius-rpc.com"
+HELIUS_PAGE_SIZE = 1000
+HELIUS_MAX_PAGES = 50   # safety cap = up to 50,000 token accounts scanned
+HELIUS_HTTP_TIMEOUT = 30.0
+
+
+def _post_json(url: str, payload: dict, timeout: float) -> dict:
+    """Minimal JSON-RPC POST using stdlib urllib - no httpx / requests."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} from Helius")
+        return json.loads(resp.read())
+
+
+def fetch_token_holders(
+    mint: str,
+    helius_api_key: str,
+    page_size: int = HELIUS_PAGE_SIZE,
+    max_pages: int = HELIUS_MAX_PAGES,
+) -> Tuple[Dict[str, int], int]:
+    """Page through `getTokenAccounts` for `mint`, aggregate by owner.
+
+    Returns (owner -> raw_balance_summed_across_accounts, total_pages_consumed).
+    `raw_balance` is in the token's smallest unit (apply decimals to display).
+    """
+    url = f"{HELIUS_BASE}/?api-key={helius_api_key}"
+    owner_balances: Dict[str, int] = {}
+    cursor: Optional[str] = None
+    pages = 0
+
+    for page in range(max_pages):
+        pages = page + 1
+        params: Dict[str, object] = {"mint": mint, "limit": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        payload = {
+            "jsonrpc": "2.0",
+            "id": f"snapshot-{page}",
+            "method": "getTokenAccounts",
+            "params": params,
+        }
+        data = _post_json(url, payload, HELIUS_HTTP_TIMEOUT)
+        result = data.get("result") or {}
+        accounts = result.get("token_accounts") or []
+        for acc in accounts:
+            owner = acc.get("owner")
+            amount_raw = acc.get("amount")
+            if not owner or amount_raw is None:
+                continue
+            try:
+                amount = int(amount_raw)
+            except (TypeError, ValueError):
+                continue
+            owner_balances[owner] = owner_balances.get(owner, 0) + amount
+
+        cursor = result.get("cursor")
+        if not cursor or not accounts:
+            break
+
+    return owner_balances, pages
+
+
+def cmd_snapshot(
+    mint: str,
+    helius_api_key: Optional[str],
+    min_balance_tokens: float,
+    decimals: int,
+    exclude_csv: Optional[str],
+    output: Optional[str],
+) -> int:
+    """Snapshot SPL-token holders via Helius and write a wallet list."""
+    api_key = (helius_api_key or os.getenv("HELIUS_API_KEY", "")).strip()
+    if not api_key:
+        print(
+            "HELIUS_API_KEY is required - pass --helius-api-key or set env var.",
+            file=sys.stderr,
+        )
+        return 1
+
+    excluded = {
+        e.strip()
+        for e in (exclude_csv or "").split(",")
+        if e.strip()
+    }
+    raw_threshold = int(min_balance_tokens * (10**decimals))
+
+    try:
+        owner_balances, pages = fetch_token_holders(mint, api_key)
+    except (urllib.error.URLError, RuntimeError, ValueError) as exc:
+        print(f"Helius request failed: {exc}", file=sys.stderr)
+        return 1
+
+    # Filter + sort by balance descending so the file reads in size order.
+    # Sort key is (raw_balance, wallet) so ties are stable.
+    qualifying = [
+        (owner, raw)
+        for owner, raw in owner_balances.items()
+        if raw >= raw_threshold and owner not in excluded
+    ]
+    qualifying.sort(key=lambda kv: (-kv[1], kv[0]))
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    header_lines = [
+        f"# snapshot of SPL token holders generated by draw.py at {timestamp}",
+        f"# mint:           {mint}",
+        f"# decimals:       {decimals}",
+        f"# min_balance:    {min_balance_tokens} tokens "
+        f"(raw threshold {raw_threshold})",
+        f"# excluded:       {sorted(excluded) if excluded else '(none)'}",
+        f"# pages_consumed: {pages} (Helius page size {HELIUS_PAGE_SIZE})",
+        f"# distinct_owners_seen: {len(owner_balances)}",
+        f"# qualifying_holders:   {len(qualifying)}",
+        "#",
+        "# wallet                                          "
+        "balance_tokens (informational - draw.py ignores comment lines)",
+    ]
+
+    out_stream = open(output, "w") if output else sys.stdout
+    try:
+        for line in header_lines:
+            print(line, file=out_stream)
+        for owner, raw in qualifying:
+            display = raw / (10**decimals)
+            # Pad the address so the comment column lines up visually,
+            # but keep the address itself on its own column - the wallet
+            # parser strips comments, so the trailing "# balance" doesn't
+            # confuse anything downstream.
+            print(f"{owner}  # {display:.{max(0, decimals)}f}", file=out_stream)
+    finally:
+        if output:
+            out_stream.close()
+
+    where = f"wrote {len(qualifying)} qualifying holder(s) to {output}"
+    if not output:
+        where = f"printed {len(qualifying)} qualifying holder(s) to stdout"
+    print(where, file=sys.stderr)
+    return 0
 
 
 def cmd_commit() -> int:
@@ -322,6 +505,49 @@ def main() -> int:
     p_verify.add_argument("--wallets", required=True)
     p_verify.add_argument("--k", type=int, default=3)
 
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="snapshot SPL token holders from Helius into a wallet list",
+    )
+    p_snap.add_argument(
+        "--mint",
+        required=True,
+        help="SPL token mint address to snapshot holders of",
+    )
+    p_snap.add_argument(
+        "--helius-api-key",
+        default=None,
+        help="Helius RPC API key (or set HELIUS_API_KEY env var)",
+    )
+    p_snap.add_argument(
+        "--min-balance",
+        type=float,
+        default=0.0,
+        help=(
+            "minimum balance (in human units, not raw) for a wallet to be "
+            "included; default 0 = all holders"
+        ),
+    )
+    p_snap.add_argument(
+        "--decimals",
+        type=int,
+        default=6,
+        help="token decimals (default 6; pump.fun launches usually 6)",
+    )
+    p_snap.add_argument(
+        "--exclude",
+        default=None,
+        help=(
+            "comma-separated wallets to drop from the snapshot (e.g. LP, "
+            "treasury, dev wallets that hold the token but should not enter)"
+        ),
+    )
+    p_snap.add_argument(
+        "--output",
+        default=None,
+        help="write to this file instead of stdout",
+    )
+
     args = parser.parse_args()
 
     if args.cmd == "commit":
@@ -331,6 +557,15 @@ def main() -> int:
     if args.cmd == "verify":
         return cmd_verify(
             args.server_seed, args.public_seed, args.wallets, args.k
+        )
+    if args.cmd == "snapshot":
+        return cmd_snapshot(
+            args.mint,
+            args.helius_api_key,
+            args.min_balance,
+            args.decimals,
+            args.exclude,
+            args.output,
         )
     parser.print_help()
     return 1
