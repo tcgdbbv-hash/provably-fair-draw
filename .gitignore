@@ -1,0 +1,17 @@
+# Committed seeds NEVER go in the repo.  This is the whole point of the
+# commit-reveal scheme: the seed must be secret until the operator chooses
+# to reveal it.
+.draw-state/
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,155 @@
+# provably-fair-draw
+
+A single Python script (`draw.py`) that picks **k distinct items** from a list
+using a **commit-reveal** RNG scheme, so that anyone can independently verify
+the operator didn't reroll until they liked the result.
+
+Built for wallet raffles, but the input is just lines of text — works equally
+well for contest entrants, giveaways, randomised running order, anything where
+"trust me, I rolled a die" isn't good enough.
+
+Standard library only (`hashlib`, `hmac`, `secrets`). No third-party packages.
+Works on any Python 3.9+ install.
+
+## Why commit-reveal
+
+If the operator runs an RNG draw with a seed they control, they can keep
+rerolling until they like the winners. The fix is two-step:
+
+| When | What | Why |
+|---|---|---|
+| **Before** the draw closes | Operator generates a 256-bit `server_seed`, publishes only `sha256(server_seed)` | Operator is now bound to that seed. Swapping it later is detectable. |
+| **After** the draw closes | Operator picks a `public_seed` from a source they *couldn't have known* at commit time (a future Solana block hash, a drand round at a future epoch, a Bitcoin block hash, etc.). Runs the draw. | Operator can't manipulate the outcome because they can't predict the public seed; participants can't manipulate it because the server seed was committed first. |
+| **Verification** | Anyone re-runs the same script with the revealed seeds + same input list and confirms the same winners come out. They also check `sha256(revealed_seed)` matches the originally published commitment. | Result is reproducible by third parties. |
+
+## Usage
+
+### Phase 1 — commit (before the draw)
+
+```
+python draw.py commit
+```
+
+Outputs:
+
+```
+========================================================================
+RAFFLE COMMITMENT (PUBLISH THE COMMITMENT HASH BEFORE THE DRAW)
+========================================================================
+  seed_file                  .draw-state/server_seed.txt
+  server_seed (KEEP SECRET)  c38cb0456f07f70bc7baf1f552ca69434f37c56049232ffeb433c258cd615c0a
+  commitment_hash (publish)  57a487a1e4996a4b0d2564810209cb3069c273e3dd032bc11823a7a0a4e413f9
+  hash function              sha256(server_seed_hex_utf8)
+```
+
+**Publish the `commitment_hash` publicly** (Twitter, Discord pin, on-chain message — anywhere immutable enough). Do not reveal the `server_seed` yet.
+
+The seed file lives at `.draw-state/server_seed.txt` and is already gitignored.
+
+### Phase 2 — draw (after the window closes)
+
+You need a `public_seed` from an external source. The rule: it must not have been *knowable at commit time*. Examples:
+
+- A Solana block hash from a slot scheduled to land at least N minutes after your commit
+- A [drand](https://drand.love) round at a future epoch
+- A Bitcoin block hash at a height that hadn't been mined yet
+
+The exact source doesn't matter as long as it's:
+- Public
+- Unpredictable at commit time
+- Verifiable by anyone after the fact
+
+Run:
+
+```
+python draw.py draw \
+  --wallets examples/wallets.txt \
+  --public-seed <hex string from your public entropy source>
+```
+
+Default is **k = 3 winners**. Override with `--k <n>`.
+
+Output reveals the server_seed, prints the winners, and shows the exact `verify` command participants can run.
+
+### Phase 3 — verify (anyone)
+
+After the operator publishes `server_seed`, `public_seed`, and the wallet list used, anyone can re-run:
+
+```
+python draw.py verify \
+  --server-seed <revealed hex> \
+  --public-seed <hex> \
+  --wallets examples/wallets.txt \
+  --k 3
+```
+
+If their reproduced winner list matches the operator's published list AND `sha256(revealed_seed)` matches the originally announced commitment, the draw is provably honest.
+
+## Algorithm
+
+1. **Canonicalise** the input list — sort + dedupe. So the same set always produces the same draw, and input order can't bias the result.
+2. **Build a CSPRNG stream** keyed by the server_seed:
+   `HMAC-SHA256(server_seed, counter || public_seed)` where `counter` is an 8-byte big-endian integer that increments per random sample.
+3. **Sample uniformly** in `[0, remaining)` via **rejection sampling** — read enough bytes to cover the upper bound, reject any value ≥ the largest multiple of `remaining` that fits in that width, then `mod`. Zero modulo bias.
+4. Remove the chosen item from the pool, repeat until `k` items selected.
+5. Return the k items in pick order.
+
+## Wallet list format
+
+`examples/wallets.txt`:
+
+```
+# One address per line. Blank lines and comments (lines starting with #) ignored.
+6dEy8K7e9rT3qNm2wXv4uYbA1cP5oZkLfH8RsTjMaJh1
+9pQrT5wXz1aBcD2eF3gHj4Kn5LmNoP6qRsTuV7wXyZa7
+4mNbV3cXz9aSdF1gH2jKl5pQ6rT7yU8oP9wX0eR1tY2u
+```
+
+The script doesn't validate that lines are valid Solana addresses or any specific format — it treats each line as an opaque identifier. So you can use it for any string-keyed draw.
+
+## Worked example
+
+End-to-end shell session you can paste into your terminal:
+
+```
+$ python draw.py commit
+seed_file                  .draw-state/server_seed.txt
+server_seed (KEEP SECRET)  c38cb0456f07f70bc7baf1f552ca69434f37c56049232ffeb433c258cd615c0a
+commitment_hash (publish)  57a487a1e4996a4b0d2564810209cb3069c273e3dd032bc11823a7a0a4e413f9
+
+# >>> Now publish the commitment hash. Wait for the draw window to close.
+# >>> Once it has, pick a public entropy source. Below uses a fictional one.
+
+$ python draw.py draw \
+    --wallets examples/wallets.txt \
+    --public-seed solana-slot-298543210-blockhash-abc123 \
+    --k 3
+
+WINNERS (in pick order):
+  1. 6dEy8K7e9rT3qNm2wXv4uYbA1cP5oZkLfH8RsTjMaJh1
+  2. GmFn8qWx2aBcD5eFgHj7Kl4MnPoQrTsUvWxYzA1bCdE3
+  3. 2HnGv4aFsKpQ8eYrTmW3xZbCdE6fGhJ5kLnPoR7uVwXy
+
+# >>> Anyone reproduces this with:
+
+$ python draw.py verify \
+    --server-seed c38cb0456f07f70bc7baf1f552ca69434f37c56049232ffeb433c258cd615c0a \
+    --public-seed solana-slot-298543210-blockhash-abc123 \
+    --wallets examples/wallets.txt \
+    --k 3
+```
+
+The reproduced winners match → draw is verified.
+
+## Security notes
+
+- The `server_seed` is generated by Python's `secrets.token_hex(32)` — a CSPRNG suitable for cryptographic use.
+- The HMAC-SHA256 keyed stream is a standard CSPRNG construction.
+- Rejection sampling eliminates modulo bias entirely (uniformity is exact, not approximate).
+- The script refuses to overwrite an existing `server_seed.txt` — you'd have to delete it manually to start a new commitment. This is intentional so an operator can't accidentally lose a committed seed.
+- `.draw-state/` is gitignored in this repo. The seed file is created with mode `0600` where the filesystem honours it.
+- This does NOT defend against the operator publishing a fake wallet list. Combine with a separately committed input snapshot (publish the wallet list's hash at commit time alongside the seed commitment).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
