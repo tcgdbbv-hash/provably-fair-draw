@@ -4,8 +4,6 @@ A single Python script (`draw.py`) that picks **k distinct items** from a list
 using a **commit-reveal** RNG scheme, so that anyone can independently verify
 the operator didn't reroll until they liked the result.
 
-> **Live demo:** [simulations/2026-05-28T20-56-45Z/PROOF.md](./simulations/2026-05-28T20-56-45Z/PROOF.md) — full end-to-end run against the [berrybounty](https://www.berrybounty.xyz) token (`AUpLqujdbYW3D9phvGoKiHEHsqnNmDxQkeHY1BhZpump`), 3 winners picked from 61 qualifying holders, public seed from a [drand](https://drand.love) round published 79 seconds after the commit.
-
 Built for wallet raffles, but the input is just lines of text — works equally
 well for contest entrants, giveaways, randomised running order, anything where
 "trust me, I rolled a die" isn't good enough.
